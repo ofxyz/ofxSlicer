@@ -1,6 +1,11 @@
 ﻿# build artifacts
 .vs/
 **/obj/
+example*/bin/*
+!example*/bin/data/
+example*/bin/data/*
+!example*/bin/data/**/
+!example*/bin/data/**/*
 dll/
 *.pdb
 *.ilk
