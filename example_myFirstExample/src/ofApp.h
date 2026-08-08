@@ -2,8 +2,6 @@
 
 
 #include "ofMain.h"
-#include "ofxAddonTemplate.h"
-
 
 class ofApp: public ofBaseApp{
 	public:

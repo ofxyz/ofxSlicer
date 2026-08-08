@@ -19,10 +19,9 @@ public:
         z = zValue;
     }
     bool operator < (const vec2key& other) const{
-        if( x == other.x){
-            return y < other.y;
-        }
-        return x < other.x;
+        if(x != other.x) return x < other.x;
+        if(y != other.y) return y < other.y;
+        return z < other.z;
     }
 };
 

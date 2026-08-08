@@ -9,6 +9,8 @@
 #include "Triangles.hpp"
 #include "ofxAssimpModelLoader.h"
 #include "vec2key.hpp"
+#include <map>
+#include <string>
 
 
 class ofxSlicer : public ofThread{
@@ -18,7 +20,8 @@ public:
     
     //methods
     void slice();
-    void loadFile(string _pathToFile);
+    void loadFile(std::string _pathToFile);
+    void buildTriangles();
     void showAssimpModel();
     void showSegments(int _layer);
     void showIntersections(int _layer);
@@ -37,13 +40,12 @@ public:
     bool hasModel;
     bool abortFlag;
     int currentProcessingLayer;
-    string currentTask; 
+    std::string currentTask; 
     ofxAssimpModelLoader model;
     std::vector<Triangles> allTriangles;
     std::vector<Triangles> activeTriangles;
     std::vector<Layer> layers;
 private:
-    void buildTriangles();
     void sortTriangles();
     void createLayers();
     void findPerim();
@@ -51,9 +53,9 @@ private:
     void findJobs(std::vector<Layer> _layers);
     void intersectionCalc(ofVec3f &p0, ofVec3f &p1, ofVec3f &p2, Layer &currentLayer);
     void createContours(Layer &currentLayer);
-    void insertHash(map<vec2key,pair<ofVec3f, ofVec3f>> &_hash, ofVec3f v, ofVec3f u);
-    std::vector<ofVec3f> startLoop( map<vec2key, pair<ofVec3f, ofVec3f>> &_hash);
-    void addToLoop(std::vector<ofVec3f> &_currentContour, map<vec2key, pair<ofVec3f, ofVec3f>> &_hash);
+    void insertHash(std::map<vec2key,std::pair<ofVec3f, ofVec3f>> &_hash, ofVec3f v, ofVec3f u);
+    std::vector<ofVec3f> startLoop(std::map<vec2key, std::pair<ofVec3f, ofVec3f>> &_hash);
+    void addToLoop(std::vector<ofVec3f> &_currentContour, std::map<vec2key, std::pair<ofVec3f, ofVec3f>> &_hash);
     
 };
 

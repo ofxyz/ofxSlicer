@@ -6,6 +6,9 @@
 //
 
 #include "ofxSlicer.h"
+#include <stdexcept>
+#include <utility>
+#include <cfloat>
 
 ofxSlicer::ofxSlicer(){
     layerHeight = 0.01;
@@ -13,14 +16,14 @@ ofxSlicer::ofxSlicer(){
     hasModel = false;
     isActive = false;
 }
-void ofxSlicer::loadFile(string _pathToFile){
+void ofxSlicer::loadFile(std::string _pathToFile){
     //Try/catch not working. Fix it!
     try {
         model.loadModel(_pathToFile);
         hasModel = true;
         
-    } catch (exception& e) {
-        std::cout << ("load failed. Check if file exist at given location.") << endl;
+    } catch (std::exception& e) {
+        ofLogError("ofxSlicer") << "load failed. Check if file exists at given location: " << e.what();
         hasModel = false; 
     }
 }
@@ -29,23 +32,40 @@ void ofxSlicer::buildTriangles(){
     int meshIndex = 0;
     ofMesh mesh = model.getMesh(meshIndex);
     
-    ofMatrix4x4 modelMatrix = model.getModelMatrix();
+    // Only apply the mesh-node matrix (internal scene-graph transform).
+    // Do NOT apply model.getModelMatrix() -- it contains OF-specific
+    // transforms (180-deg Z rotation + screen-pixel normalization)
+    // that distort the raw geometry we need for slicing.
     ofMatrix4x4 meshMatrix = model.getMeshHelper(meshIndex).matrix;
-    ofMatrix4x4 concatMatrix;
-    concatMatrix.preMult(modelMatrix);
-    concatMatrix.preMult(meshMatrix);
     
-    for(int i = 0; i < mesh.getNumVertices(); i++){
-        ofVec3f & vert = mesh.getVertices()[i];
-        vert.set(concatMatrix.preMult(vert));
+    for(size_t i = 0; i < mesh.getNumVertices(); i++){
+        auto vert = mesh.getVertices()[i];
+        vert = meshMatrix.preMult(ofVec3f(vert));
         mesh.setVertex(i, vert);
     }
-    std::vector<ofMeshFace> faces = mesh.getUniqueFaces();
-    //loop through the faces and create triangle objects
-    for(auto f = faces.begin(); f != faces.end(); f++){
-        Triangles newTriangle(f->getVertex(0),f->getVertex(1), f->getVertex(2));
-        allTriangles.push_back(newTriangle);
+
+    if (mesh.getNumIndices() > 0) {
+        // Indexed mesh: build triangles from index buffer
+        for (size_t i = 0; i + 2 < mesh.getNumIndices(); i += 3) {
+            ofVec3f v0 = mesh.getVertex(mesh.getIndex(i));
+            ofVec3f v1 = mesh.getVertex(mesh.getIndex(i + 1));
+            ofVec3f v2 = mesh.getVertex(mesh.getIndex(i + 2));
+            allTriangles.push_back(Triangles(v0, v1, v2));
+        }
+    } else {
+        // Non-indexed mesh (common for STL files): consecutive groups of 3 vertices
+        for (size_t i = 0; i + 2 < mesh.getNumVertices(); i += 3) {
+            ofVec3f v0 = mesh.getVertex(i);
+            ofVec3f v1 = mesh.getVertex(i + 1);
+            ofVec3f v2 = mesh.getVertex(i + 2);
+            allTriangles.push_back(Triangles(v0, v1, v2));
+        }
     }
+
+    ofLogNotice("ofxSlicer") << "buildTriangles: " << mesh.getNumVertices()
+        << " verts, " << mesh.getNumIndices() << " indices, "
+        << allTriangles.size() << " triangles";
+
     sortTriangles();
 }
 struct compareVector{
@@ -64,39 +84,64 @@ void ofxSlicer::sortTriangles(){
     findPerim();
 }
 void ofxSlicer::createLayers(){
-    int numberOfLayers = (layerMax-layerMin)/layerHeight;
-    for(int i = 0; i < numberOfLayers; i++){
-        layers.push_back(Layer(layerHeight*i));
+    if (layerMax <= layerMin || layerHeight <= 0) {
+        ofLogWarning("ofxSlicer") << "createLayers: invalid range or layerHeight ("
+            << layerMin << " -> " << layerMax << ", step " << layerHeight << ")";
+        return;
     }
+    int numberOfLayers = (int)((layerMax - layerMin) / layerHeight);
+    static constexpr int kMaxLayers = 5000;
+    if (numberOfLayers > kMaxLayers) {
+        ofLogWarning("ofxSlicer") << "createLayers: clamping " << numberOfLayers
+            << " layers to " << kMaxLayers << " (consider increasing layer height)";
+        numberOfLayers = kMaxLayers;
+    }
+    // Start the first layer half a step above layerMin to avoid slicing exactly
+    // at triangle boundaries where intersection calculations are degenerate.
+    float startZ = layerMin + layerHeight * 0.5f;
+    for (int i = 0; i < numberOfLayers; i++) {
+        layers.push_back(Layer(startZ + layerHeight * i));
+    }
+    ofLogNotice("ofxSlicer") << "createLayers: " << layers.size()
+        << " layers from z=" << startZ << " to z=" << (startZ + layerHeight * (numberOfLayers - 1));
 }
 void ofxSlicer::findIntersectionPoints(std::vector<Layer> &_layers){
     activeTriangles = allTriangles;
-    //loop trough all layers
-    for(int l = 0; l < _layers.size(); l++){
-        //add relevant triangles to active triangle vector
+    size_t totalContours = 0;
+    size_t totalSegments = 0;
+    for(size_t l = 0; l < _layers.size(); l++){
         for(auto t = activeTriangles.begin(); t != activeTriangles.end();){
             if(t->zMax < _layers[l].layerHeight){
-                //entire triangle above layerHeight.
-                activeTriangles.erase(t);
+                t = activeTriangles.erase(t);
             }
             else if(t->zMin > _layers[l].layerHeight){
-                //entire triangle below layerHeight.
+                ++t;
             }
             else{
-                //the sweet spot. Calculate intersection points
-                intersectionCalc(t->points[0], t->points[1], t->points[2], layers[l]);
+                intersectionCalc(t->points[0], t->points[1], t->points[2], _layers[l]);
+                ++t;
             }
-            t++;
         }
+        totalSegments += _layers[l].segments.size();
         createContours(_layers[l]);
+        totalContours += _layers[l].contours.size();
     }
+    ofLogNotice("ofxSlicer") << "findIntersectionPoints: " << _layers.size()
+        << " layers, " << totalSegments << " segments, " << totalContours << " contours";
 }
 
 void ofxSlicer::findPerim(){
+    if (allTriangles.empty()) {
+        layerMin = 0;
+        layerMax = 0;
+        ofLogWarning("ofxSlicer") << "findPerim: no triangles, nothing to slice";
+        return;
+    }
     Triangles lastTriangle = allTriangles.back();
     Triangles firstTriangle = allTriangles.front();
     layerMax = lastTriangle.zMax;
     layerMin = firstTriangle.zMin;
+    ofLogNotice("ofxSlicer") << "findPerim: zMin=" << layerMin << " zMax=" << layerMax;
 }
 void ofxSlicer::showAssimpModel(){
     ofSetColor(255, 15);
@@ -165,42 +210,54 @@ void ofxSlicer::intersectionCalc(ofVec3f &p0, ofVec3f&p1, ofVec3f &p2, Layer &cu
 //review this function and its sub-function. Something is fishy...
 void ofxSlicer::createContours(Layer &currentLayer){
     //create the an initial hash table
-    typedef pair<ofVec3f, ofVec3f> vec_pair;
-    map<vec2key, vec_pair> hash;
+    typedef std::pair<ofVec3f, ofVec3f> vec_pair;
+    std::map<vec2key, vec_pair> hash;
     
     for(auto s = currentLayer.segments.begin(); s != currentLayer.segments.end(); s++){
         //fill the hash table with segments and one blank space seg(u,v) -> hash(key = u, value {v, *} and  hash(key = v, value {u, *}
         ofPolyline q = *s;
-        if(q[0].distance(q[1]) > 0.0001){
+        if(glm::distance(glm::vec3(q[0]), glm::vec3(q[1])) > 0.0001f){
             insertHash(hash, q[0], q[1]);
             insertHash(hash, q[1], q[0]);
         }
     }
-    //loop trough hash and build contours
+    //loop through hash and build contours
     while(!hash.empty()){
         std::vector<ofVec3f> newContour = startLoop(hash);
         addToLoop(newContour, hash);
         
-        //loop trough all the generated points and convert them to a polyline
+        if (newContour.size() < 3) continue; // skip degenerate fragments
+        
         ofPolyline p;
-        for(auto it = newContour.begin(); it!= newContour.end(); it++){
-            p.addVertex(ofVec3f(it->x,it->y,it->z));
+        for(const auto& v : newContour){
+            p.addVertex(ofVec3f(v.x, v.y, v.z));
         }
+        
+        // If the walker closed the loop, the last vertex duplicates the first.
+        // Remove the duplicate and mark the polyline as closed instead.
+        if (p.size() >= 2) {
+            auto& verts = p.getVertices();
+            if (glm::distance(glm::vec3(verts.front()), glm::vec3(verts.back())) < 0.001f) {
+                verts.pop_back();
+            }
+            p.close();
+        }
+        
         currentLayer.contours.push_back(p);
     }
 }
-void ofxSlicer::insertHash(map<vec2key,pair<ofVec3f, ofVec3f>> &_hash, ofVec3f u, ofVec3f v){
+void ofxSlicer::insertHash(std::map<vec2key,std::pair<ofVec3f, ofVec3f>> &_hash, ofVec3f u, ofVec3f v){
     auto search = _hash.find(vec2key(u.x, u.y,u.z));
     if(search == _hash.end()){
         //key does not exist. Make it
-        _hash.insert(make_pair(vec2key(u.x,u.y,u.z), make_pair(v, ofVec3f(0))));
+        _hash.insert(std::make_pair(vec2key(u.x,u.y,u.z), std::make_pair(v, ofVec3f(0))));
     }
     else{
         //key exists, add second point to hash with current index
         (*search).second.second = v;
     }
 }
-std::vector<ofVec3f> ofxSlicer::startLoop(map<vec2key, pair<ofVec3f, ofVec3f> > &_hash){
+std::vector<ofVec3f> ofxSlicer::startLoop(std::map<vec2key, std::pair<ofVec3f, ofVec3f> > &_hash){
     std::vector<ofVec3f> p;
     auto it = _hash.begin();
     p.push_back(ofVec3f(it->first.x,it->first.y,it->first.z));
@@ -209,56 +266,47 @@ std::vector<ofVec3f> ofxSlicer::startLoop(map<vec2key, pair<ofVec3f, ofVec3f> > 
     return p;
 }
 
-void ofxSlicer::addToLoop(std::vector<ofVec3f> &p ,map<vec2key, pair<ofVec3f, ofVec3f> > &_hash){
+void ofxSlicer::addToLoop(std::vector<ofVec3f> &p ,std::map<vec2key, std::pair<ofVec3f, ofVec3f> > &_hash){
     ofVec3f first = p.front();
     ofVec3f current = p.back();
     
     while(true){
-        auto it = _hash.find(vec2key(current.x,current.y,current.z));
-        if(it ==_hash.end()){
-            ofLog() << "deadend";
+        auto it = _hash.find(vec2key(current.x, current.y, current.z));
+        if(it == _hash.end()){
             break;
         }
-        //find unused neighboor of current
-        std::vector<ofVec3f> vw = {(*it).second.first, (*it).second.second};
         
-        ofVec3f next = vw.at(0); //first unused neighbor of current
+        ofVec3f n1 = it->second.first;
+        ofVec3f n2 = it->second.second;
+        
+        // Determine previous vertex so we don't backtrack
+        ofVec3f prev = (p.size() >= 2) ? p[p.size() - 2] : ofVec3f(FLT_MAX);
+        
+        // Choose the neighbor that is NOT the vertex we came from
+        ofVec3f next;
+        if (n1 == prev) {
+            next = n2;
+        } else {
+            next = n1;
+        }
+        
+        _hash.erase(it);
+        
+        // Sentinel check: uninitialized second neighbor is ofVec3f(0).
+        // Since all intersection points have z == layerHeight != 0,
+        // the sentinel (0,0,0) will never collide with a valid point.
+        static const ofVec3f kSentinel(0, 0, 0);
+        if (next == kSentinel) {
+            break;
+        }
+        
         p.push_back(next);
-        _hash.erase(vec2key(current.x, current.y, current.z));
-        if(next == first){
-            //contour closed.
-            ofLog() << "loop closed";
+        
+        if (next == first) {
             break;
         }
         current = next;
     }
-    //search for nextPoint
-    //ofVec3f current = _currentContour.
-    //ofVec3f first = _contour.front();
-    //ofVec3f last;
-    //find next vertices
-//    while(true){
-//        auto it = _hash.find(vec2key(current.x,current.y,current.z));
-//        if(it == _hash.end()){
-//            //dead end. Break loop
-//            break;
-//            std::cout << "fuckup!" << endl;
-//        }
-//        ofVec3f key1 = ofVec3f(it->first.x, it->first.y, it->first.z);
-//        //get next unused neighboor of current
-//        std::vector<ofVec3f> vw = {(*it).second.first, (*it).second.second};
-//        ofVec3f next = vw.at(0); //first unused neighbor of current
-//        _contour.push_back(next);
-//
-//        //remove the used segment from hash.
-//        //continue to next segment
-//        _hash.erase(vec2key(current.x, current.y, current.z));
-//        if(next == first){
-//            //contour closed.
-//            break;
-//        }
-//        current = next;
-//    }
 }
 
 // ---------------------THREADING-------------------------
@@ -275,7 +323,7 @@ void ofxSlicer::threadedFunction(){
     {
         sliceFinished = false;
         currentTask = "slicer initiating";
-        std:: cout << "i am a thread and i am running" << endl;
+        ofLogNotice("ofxSlicer") << "slicer thread started";
         //Do slicing and put information into each layer
         currentTask = "cleaning memory";
         cleanSlicer();
@@ -287,7 +335,7 @@ void ofxSlicer::threadedFunction(){
         findIntersectionPoints(layers);
         stopSlice();
         sliceFinished = true;
-        std::cout << "sliced!" << endl;
+        ofLogNotice("ofxSlicer") << "slicing complete";
         currentTask = ""; 
         //Run slicer animation and update relevant GUI.
     }
